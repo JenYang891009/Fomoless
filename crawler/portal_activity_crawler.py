@@ -1,6 +1,9 @@
 """
 FomoLess 爬蟲組：中央大學 iNCU「活動報名系統」爬蟲（用自己的登入 session）
 
+※ 暫時措施：計中活動 API 上線後移除。
+  cookie 是個人登入身分，不放雲端；只在組員自己的電腦排程執行，輸出 JSON 再上傳 S3。
+
 欄位依「FomoLess 活動 API 欄位需求（草案）」一、二節的表格，
 從「活動列表」和「活動詳細資料」兩個頁面抓：
   列表頁  https://cis.ncu.edu.tw/iNCU/messageNotice/activityManagement/activity?page=N
@@ -17,7 +20,7 @@ FomoLess 爬蟲組：中央大學 iNCU「活動報名系統」爬蟲（用自己
   py -m pip install requests beautifulsoup4
   py portal_activity_crawler.py crawl              # 所有還沒結束的活動 → output/portal_activities_日期.json
   py portal_activity_crawler.py crawl -n 5         # 測試：只抓 5 則
-  py portal_activity_crawler.py crawl --new-only   # 只抓 seen_ids.json 裡沒有的
+  py portal_activity_crawler.py crawl --new-only   # 測試用：只抓 seen_ids.json 裡沒有的（每天上傳請跑完整 crawl）
   py portal_activity_crawler.py samples output/portal_activities_日期.json   # 挑 3 筆範例到 samples/
   py portal_activity_crawler.py probe <網址>        # 存下頁面原始碼到 debug/，看結構用
 
@@ -46,6 +49,7 @@ DELAY_SEC = 1.0  # 每個 request 間隔 1 秒，對學校主機友善
 HEADERS = {"User-Agent": "Mozilla/5.0 (FomoLess NCU student project)"}
 LOGIN_HINTS = ("login", "signin", "/cas/", "oauth", "authorize", "sso")
 TZ = "+08:00"
+PORTAL_BTN_RE = re.compile(r"報名|截止|額滿|未開放|備取|候補")  # 場次的 Portal 報名按鈕（含已截止、額滿等停用狀態）
 FORM_RE = re.compile(r"https?://(?:docs\.google\.com/forms|forms\.gle|forms\.office\.com|www\.surveycake\.com)[^\s\"'<>]*")
 
 
@@ -216,7 +220,9 @@ def scrape_detail(s: requests.Session, url: str) -> list[dict]:
     for i, pane in enumerate(panes):
         pane_dl = pane.find("dl", class_="row")
         sess = dl_pairs(pane_dl) if pane_dl else {}
-        button = pane.find("button")  # 例：已截止
+        # 報名按鈕：可能是 <button>（例：已截止，disabled）或 <a class="btn">（例：報名 → /activity/{場次}/edit）
+        buttons = pane.select("button, a.btn")
+        button = next((b for b in buttons if PORTAL_BTN_RE.search(b.get_text())), None) or pane.find("button")
         blob = pane.get_text(" ", strip=True)
         registered, capacity_shown = count_pair("報名人數", blob)
         waitlisted, waitlist_shown = count_pair("備取人數", blob)
@@ -226,7 +232,8 @@ def scrape_detail(s: requests.Session, url: str) -> list[dict]:
 
         reg_start, reg_end = iso_range(text(sess.get("報名時間")))
         start_at, end_at = iso_range(text(sess.get("場次時間")))
-        forms = FORM_RE.findall(str(desc_dd or "") + str(session_desc or ""))
+        # 表單連結：先找這個場次自己的說明，找不到才用活動內容（活動內容的連結會套到每一場）
+        forms = FORM_RE.findall(str(session_desc or "")) or FORM_RE.findall(str(desc_dd or ""))
 
         # raw_fields：內頁畫面上顯示的「標籤 → 文字」原樣保留（活動內容也放這裡）
         raw = dict(activity_raw)
@@ -250,6 +257,7 @@ def scrape_detail(s: requests.Session, url: str) -> list[dict]:
             "organizer": text(info.get("承辦單位")),
             "audience": audience,
             "button_status": text(button),
+            "has_portal_button": bool(button and PORTAL_BTN_RE.search(text(button) or "")),
             "speaker": text(sess.get("講師")) or None,
             "location": text(sess.get("地點")),
             "start_at": start_at, "end_at": end_at,
@@ -290,11 +298,21 @@ def build_record(item: dict, d: dict) -> dict:
     if re.search(r"截止|未開放|額滿", btn):
         status = btn
     elif "報名" in btn:  # 「我要報名」「取消報名」→ 這一場還能報名
+        # 注意：按鈕文字跟 cookie 主人有關（自己報過名會顯示「取消報名」）；
+        # 額滿與否另外用報名人數／上限判斷（registration_status），不只看按鈕
         status = "報名中"
     else:
         status = item["list_status"] or btn or None
+    # 報名方式：場次有 Portal 報名按鈕 → portal（就算內文也有校外表單，學生走 Portal）
+    #           沒有按鈕、但有表單連結 → external；兩種都沒有（免報名）→ none
+    if d["has_portal_button"]:
+        method, reg_url = "portal", None
+    elif d["registration_url"]:
+        method, reg_url = "external", d["registration_url"]
+    else:
+        method, reg_url = "none", None
     return {
-        "pk": f"portal.activity#{item['activity_id']}#{d['session_id']}",  # DynamoDB 用：活動＋場次
+        "pk": f"portal.activity#{item['activity_id']}#{d['session_id']}",  # 唯一鍵：活動＋場次
         # 一、活動資料
         "activity_id": item["activity_id"],
         "session_id": d["session_id"],  # 場次編號；一個活動有幾場就輸出幾筆
@@ -314,8 +332,8 @@ def build_record(item: dict, d: dict) -> dict:
         "location_code": None,  # 網頁上沒有
         "start_at": d["start_at"], "end_at": d["end_at"],
         "registration_start": d["registration_start"], "registration_end": d["registration_end"],
-        "registration_method": "external" if d["registration_url"] else "portal",
-        "registration_url": d["registration_url"],
+        "registration_method": method,  # portal／external／none
+        "registration_url": reg_url,
         "capacity": d["capacity"], "registered_count": d["registered_count"],
         "waitlist_capacity": d["waitlist_capacity"], "waitlist_count": d["waitlist_count"],
         "registration_status": registration_status(status, d["registered_count"], d["capacity"]),
@@ -345,27 +363,6 @@ class FileSeenStore:
         self.path.write_text(json.dumps(self.ids, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-class DynamoSeenStore:
-    """Lambda 版：查 DynamoDB 有沒有這個 pk；新的才寫入（表名用環境變數 FOMOLESS_TABLE）"""
-
-    def __init__(self, table: str):
-        import boto3
-        self.table = boto3.resource("dynamodb").Table(table)
-
-    def has(self, aid: str) -> bool:
-        return "Item" in self.table.get_item(Key={"pk": f"portal.activity#{aid}"}, ProjectionExpression="pk")
-
-    def add(self, rec: dict):
-        from decimal import Decimal
-        from botocore.exceptions import ClientError
-        rec = json.loads(json.dumps(rec), parse_float=Decimal)  # DynamoDB 不收 float
-        try:
-            self.table.put_item(Item=rec, ConditionExpression="attribute_not_exists(pk)")
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                raise
-
-
 def not_ended(rec: dict, now: datetime) -> bool:
     """活動還沒結束：end_at（沒有就用 start_at）還在現在之後；兩個都沒有就保留。"""
     t = rec["end_at"] or rec["start_at"]
@@ -375,7 +372,7 @@ def not_ended(rec: dict, now: datetime) -> bool:
 def crawl(limit: int | None = None, max_pages: int = 50, store=None, include_ended: bool = False) -> list[dict]:
     """抓 iNCU 活動 → list[dict]。
     預設：翻完全部列表頁，回傳「所有還沒結束的活動」。
-    store：有給（FileSeenStore / DynamoSeenStore）就只抓沒抓過的。"""
+    store：測試用，有給 FileSeenStore 就只抓沒抓過的；每天上傳請跑完整 crawl（不給 store）。"""
     s = load_session()
     items = collect_new(s, max_pages, store)
     print(f"[list] 這次要抓 {len(items)} 則活動內頁")
@@ -428,12 +425,6 @@ def probe(url: str):
     print(f"[probe] {resp.status_code} {resp.url} → 已存到 debug/{name}.html（裡面有你的姓名，分享前看一下）")
 
 
-def lambda_handler(event, context):
-    """EventBridge 每天觸發一次。注意：個人 cookie 會過期，只適合測試。"""
-    items = crawl(limit=(event or {}).get("limit"))
-    return {"count": len(items), "items": items}
-
-
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="NCU iNCU 活動報名爬蟲")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -442,7 +433,7 @@ if __name__ == "__main__":
     pc = sub.add_parser("crawl", help="抓活動列表＋內頁")
     pc.add_argument("-n", "--limit", type=int, help="最多抓幾則（測試用）")
     pc.add_argument("--pages", type=int, default=50, help="最多翻幾頁")
-    pc.add_argument("--new-only", action="store_true", help="只抓 seen_ids.json 裡沒有的活動")
+    pc.add_argument("--new-only", action="store_true", help="測試用：只抓 seen_ids.json 裡沒有的活動（每天上傳請跑完整 crawl）")
     pc.add_argument("--include-ended", action="store_true", help="已結束的活動也輸出")
     pc.add_argument("--state", default="seen_ids.json")
     pc.add_argument("-o", "--output", help="預設 output/portal_activities_YYYY-MM-DD.json")
@@ -459,6 +450,8 @@ if __name__ == "__main__":
         else:
             store = FileSeenStore(args.state) if args.new_only else None
             data = crawl(args.limit, args.pages, store, args.include_ended)
+            if not data and not args.new_only:
+                sys.exit("[error] 沒有抓到任何活動，不輸出檔案（請檢查 cookie 或網頁結構）")
             out = Path(args.output or f"output/portal_activities_{datetime.now():%Y-%m-%d}.json")
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
