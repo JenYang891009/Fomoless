@@ -77,8 +77,17 @@ def load_session() -> requests.Session:
 
 
 def fetch(s: requests.Session, url: str) -> requests.Response:
-    resp = s.get(url, timeout=20, allow_redirects=True)
+    # 不讓 requests 自動轉址：cookie 放在 header，自動轉址到別的網域會把 cookie 一起送出去
+    resp = s.get(url, timeout=20, allow_redirects=False)
     time.sleep(DELAY_SEC)
+    for _ in range(5):
+        if not resp.is_redirect:
+            break
+        nxt = urljoin(resp.url, resp.headers.get("Location", ""))
+        if any(h in nxt.lower() for h in LOGIN_HINTS) or urlparse(nxt).netloc != urlparse(url).netloc:
+            raise SessionExpired(f"被轉址到登入頁或其他網域（{nxt}），為了不外洩 cookie 先停止 → cookie 可能過期，請重新複製")
+        resp = s.get(nxt, timeout=20, allow_redirects=False)
+        time.sleep(DELAY_SEC)
     if any(h in resp.url.lower() for h in LOGIN_HINTS) or resp.status_code in (401, 403):
         raise SessionExpired(f"被導到登入頁或拒絕存取（{resp.status_code} {resp.url}）→ cookie 過期，請重新複製")
     resp.raise_for_status()
@@ -229,6 +238,9 @@ def scrape_detail(s: requests.Session, url: str) -> list[dict]:
         session_desc = pane_dl.find("dd", class_="col-sm-12", recursive=False) if pane_dl else None
         title_h3 = pane_dl.find("h3") if pane_dl else None
         pane_id = pane.get("id") or ""
+        if not pane_id.startswith("event"):
+            # 找不到場次編號時用流水號，場次順序一變 id 就會變，需要留意
+            print(f"  [warning] {url} 第 {i + 1} 個場次找不到場次編號，暫用流水號 {i + 1}")
 
         reg_start, reg_end = iso_range(text(sess.get("報名時間")))
         start_at, end_at = iso_range(text(sess.get("場次時間")))
